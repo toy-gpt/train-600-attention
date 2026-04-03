@@ -113,6 +113,12 @@ class ModelLike(Protocol):
     def pos_embeddings(self) -> list[list[float]] | None: ...
     @property
     def bias(self) -> list[float] | None: ...
+    @property
+    def W_Q(self) -> list[list[float]] | None: ...
+    @property
+    def W_K(self) -> list[list[float]] | None: ...
+    @property
+    def W_V(self) -> list[list[float]] | None: ...
 
 
 __all__ = [
@@ -189,6 +195,10 @@ def artifact_paths_from_base_dir(base_dir: Path) -> dict[str, Path]:
         "01_vocabulary.csv": artifacts_dir / "01_vocabulary.csv",
         "02_model_weights.csv": artifacts_dir / "02_model_weights.csv",
         "03_token_embeddings.csv": artifacts_dir / "03_token_embeddings.csv",
+        "04_positional_embeddings.csv": artifacts_dir / "04_positional_embeddings.csv",
+        "05_W_Q.csv": artifacts_dir / "05_W_Q.csv",
+        "06_W_K.csv": artifacts_dir / "06_W_K.csv",
+        "07_W_V.csv": artifacts_dir / "07_W_V.csv",
     }
 
 
@@ -247,6 +257,23 @@ def write_positional_embeddings_csv(
     LOG.info(f"Wrote positional embeddings to {path}")
 
 
+def write_projection_csv(path: Path, model: ModelLike, attr: str) -> None:
+    """Write a projection matrix (W_Q, W_K, or W_V) to CSV.
+    Shape: embedding_dim rows x head_dim columns.
+    """
+    matrix: list[list[float]] | None = getattr(model, attr, None)
+    if matrix is None:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    dim = len(matrix[0])
+    with path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["row"] + [f"dim_{k}" for k in range(dim)])
+        for i, row in enumerate(matrix):
+            writer.writerow([i] + [_fmt_float(v, decimals=6) for v in row])
+    LOG.info(f"Wrote {attr} to {path}")
+
+
 def write_artifacts(
     *,
     base_dir: Path,
@@ -278,12 +305,21 @@ def write_artifacts(
     embeddings_path: Final[Path] = artifacts_dir / "03_token_embeddings.csv"
     pos_embeddings_path: Final[Path] = artifacts_dir / "04_positional_embeddings.csv"
 
+    wq_path: Final[Path] = artifacts_dir / "05_W_Q.csv"
+    wk_path: Final[Path] = artifacts_dir / "06_W_K.csv"
+    wv_path: Final[Path] = artifacts_dir / "07_W_V.csv"
+
     artifacts_dir.mkdir(parents=True, exist_ok=True)
 
     write_vocabulary_csv(vocab_path, vocab)
     write_model_weights_csv(weights_path, vocab, model, row_labeler=row_labeler)
     write_token_embeddings_csv(embeddings_path, vocab, model)
     write_positional_embeddings_csv(pos_embeddings_path, model)
+
+    write_projection_csv(wq_path, model, "W_Q")
+    write_projection_csv(wk_path, model, "W_K")
+    write_projection_csv(wv_path, model, "W_V")
+
     write_meta_json(
         meta_path,
         base_dir=base_dir,
