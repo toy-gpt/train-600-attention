@@ -13,7 +13,7 @@ and debugging.
 
 import math
 
-__all__ = ["argmax", "cross_entropy_loss"]
+__all__ = ["argmax", "cross_entropy_loss", "softmax"]
 
 
 def argmax(values: list[float]) -> int:
@@ -113,3 +113,26 @@ def cross_entropy_loss(probs: list[float], target_id: int) -> float:
     p = max(p, 1e-12)
 
     return -math.log(p)
+
+
+def softmax(scores: list[float]) -> list[float]:
+    """Convert raw scores into a probability distribution.
+
+    Concept:
+        Softmax transforms any list of real numbers into probabilities
+        that sum to 1.0. Larger input values produce larger probabilities.
+
+    Numerical stability:
+        We subtract the maximum score before exponentiating to prevent
+        overflow. This does not change the output.
+
+    Args:
+        scores: Raw score values (logits).
+
+    Returns:
+        Probability distribution summing to 1.0.
+    """
+    max_score = max(scores)
+    exp_scores = [math.exp(s - max_score) for s in scores]
+    total = sum(exp_scores)
+    return [s / total for s in exp_scores]

@@ -1,28 +1,31 @@
-"""d_train.py - Training loop module.
+"""d_train.py - Training loop for the attention-based next-token model.
 
-Trains the SimpleNextTokenModel on a small token corpus
-using a context-3 window (three preceding tokens).
+Trains AttentionNextTokenModel on a token corpus using a sliding context window.
 
 Responsibilities:
-- Create ((token_{t-2}, token_{t-1}, token_t) -> next_token) training pairs
-- Run a basic gradient-descent training loop
+- Create (context_ids -> next_token_id) training pairs
+- Run gradient descent updating all parameter groups
 - Track loss and accuracy per epoch
 - Write a CSV log of training progress
-- Write inspectable training artifacts (vocabulary, weights, embeddings, meta)
+- Write inspectable training artifacts
 
 Concepts:
-- softmax: converts raw scores into probabilities (so predictions sum to 1)
-- cross-entropy loss: measures how well predicted probabilities match the correct token
-- gradient descent: iterative weight updates to minimize loss
-  - think descending to find the bottom of a valley in a landscape
-  - where the valley floor corresponds to lower prediction error
+- backpropagation through attention: gradients flow from the output projection
+  back through the attention weighted sum, then through Q/K/V projections,
+  and finally into the embedding vectors.
+- attention gradient: the softmax over attention scores has a Jacobian;
+  the gradient through it uses the standard softmax backward formula.
+- gradient clipping: caps individual gradient values before applying updates.
+  Prevents weight explosion when gradients compound through multiple layers.
+  Standard practice for attention and RNN training.
 
-Notes:
-- This remains intentionally simple: no deep learning framework, no Transformer.
-- The model generalizes n-gram training by expanding the context window.
-- Training updates weight rows associated with the observed context-3 pattern.
-- token_embeddings.csv remains a derived visualization artifact;
-  learned embeddings are introduced in later stages.
+Key difference from embeddings (d_train.py in train-500-embeddings):
+- Embeddings concatenate context vectors and pass through a single linear layer.
+  Gradient flows back through W and into embeddings directly.
+- Attention routes gradient through W_out, then back through the attention
+  weighted sum (touching W_V), then through the attention score softmax
+  (touching W_Q and W_K), then into embeddings.
+  Six parameter groups are updated per example vs two in train-500.
 """
 
 import logging
@@ -31,15 +34,19 @@ from typing import Final
 
 from datafun_toolkit.logger import get_logger, log_header, log_path
 
-from toy_gpt_train.c_model import SimpleNextTokenModel
+from toy_gpt_train.c_model import (
+    DEFAULT_CONTEXT_SIZE,
+    DEFAULT_EMBEDDING_DIM,
+    DEFAULT_HEAD_DIM,
+    AttentionNextTokenModel,
+)
 from toy_gpt_train.io_artifacts import (
-    RowLabeler,
     VocabularyLike,
     find_single_corpus_file,
     write_artifacts,
     write_training_log,
 )
-from toy_gpt_train.math_training import argmax, cross_entropy_loss
+from toy_gpt_train.math_training import argmax, cross_entropy_loss, softmax
 
 LOG: logging.Logger = get_logger("TRAIN", level="INFO")
 
@@ -47,125 +54,335 @@ BASE_DIR: Final[Path] = Path(__file__).resolve().parents[2]
 OUTPUTS_DIR: Final[Path] = BASE_DIR / "outputs"
 TRAIN_LOG_PATH: Final[Path] = OUTPUTS_DIR / "train_log.csv"
 
-type Context3 = tuple[int, int, int]
-type Context3Pair = tuple[Context3, int]
+# WHY: Gradient clipping prevents weight explosion in attention training.
+# Gradients compound through Q/K/V projections and the attention softmax;
+# without clipping, a single large gradient can destroy all learned weights.
+MAX_GRAD: Final[float] = 1.0
+
+type ContextPair = tuple[list[int], int]
 
 
-def token_row_index_context3(context_ids: Context3, vocab_size: int) -> int:
-    """Return the row index for a context-3 token sequence.
+def make_training_pairs(
+    token_ids: list[int],
+    context_size: int,
+) -> list[ContextPair]:
+    """Convert token IDs into (context_ids, next_id) training pairs.
 
-    Context order:
-        (token_id_{t-2}, token_id_{t-1}, token_id_t)
-
-    Flattening scheme:
-        row_index = a * vocab_size^2 + b * vocab_size + c
-
-    This is the context-3 analogue of:
-        unigram: row = token_id
-        bigram:  row = prev_id * vocab_size + curr_id
-    """
-    token_id_t_minus_2, token_id_t_minus_1, token_id_t = context_ids
-    return (
-        token_id_t_minus_2 * vocab_size * vocab_size
-        + token_id_t_minus_1 * vocab_size
-        + token_id_t
-    )
-
-
-def row_labeler_context3(vocab: VocabularyLike, vocab_size: int) -> RowLabeler:
-    """Map a context-3 row index to a label like 'tok_{t-2}|tok_{t-1}|tok_t'."""
-
-    def label(row_idx: int) -> str:
-        token_id_t_minus_2: int = row_idx // (vocab_size * vocab_size)
-        remainder: int = row_idx % (vocab_size * vocab_size)
-
-        token_id_t_minus_1: int = remainder // vocab_size
-        token_id_t: int = remainder % vocab_size
-
-        tok2: str = vocab.get_id_token(token_id_t_minus_2) or f"id_{token_id_t_minus_2}"
-        tok1: str = vocab.get_id_token(token_id_t_minus_1) or f"id_{token_id_t_minus_1}"
-        tok0: str = vocab.get_id_token(token_id_t) or f"id_{token_id_t}"
-
-        return f"{tok2}|{tok1}|{tok0}"
-
-    return label
-
-
-def make_training_pairs(token_ids: list[int]) -> list[Context3Pair]:
-    """Convert token IDs into ((t-2, t-1, t), next) training pairs.
-
-    Example:
+    Example (context_size=2):
         ids = [3, 1, 2, 4, 5]
-        pairs = [((3, 1, 2), 4), ((1, 2, 4), 5)]
+        pairs = [([3, 1], 2), ([1, 2], 4), ([2, 4], 5)]
     """
-    pairs: list[Context3Pair] = []
-    for i in range(len(token_ids) - 3):
-        context_ids: Context3 = (token_ids[i], token_ids[i + 1], token_ids[i + 2])
-        next_id: int = token_ids[i + 3]
+    pairs: list[ContextPair] = []
+    for i in range(len(token_ids) - context_size):
+        context_ids = token_ids[i : i + context_size]
+        next_id = token_ids[i + context_size]
         pairs.append((context_ids, next_id))
     return pairs
 
 
+def row_labeler_attention(vocab: VocabularyLike, context_size: int):  # type: ignore[return]
+    """Map a W_out row index to a label for artifact inspection."""
+
+    def label(row_idx: int) -> str:
+        return f"head_dim_{row_idx}"
+
+    return label
+
+
+def _clip(val: float) -> float:
+    """Clip a gradient value to [-MAX_GRAD, MAX_GRAD]."""
+    return max(-MAX_GRAD, min(MAX_GRAD, val))
+
+
+def _softmax_backward(weights: list[float], d_out: list[float]) -> list[float]:
+    """Backward pass through softmax.
+
+    Given softmax output weights and upstream gradient d_out,
+    compute the gradient w.r.t. the pre-softmax scores.
+
+    Formula (Jacobian of softmax):
+        d_scores[i] = weights[i] * (d_out[i] - sum_j(weights[j] * d_out[j]))
+
+    Args:
+        weights: Softmax output (attention weights), length n.
+        d_out:   Upstream gradient, length n.
+
+    Returns:
+        Gradient w.r.t. pre-softmax scores, length n.
+    """
+    dot = sum(weights[j] * d_out[j] for j in range(len(weights)))
+    return [weights[i] * (d_out[i] - dot) for i in range(len(weights))]
+
+
 def train_model(
-    model: "SimpleNextTokenModel",
-    pairs: list[Context3Pair],
+    model: AttentionNextTokenModel,
+    pairs: list[ContextPair],
     learning_rate: float,
     epochs: int,
 ) -> list[dict[str, float]]:
-    """Train the model using gradient descent on softmax cross-entropy (context-3).
+    """Train the model with gradient descent on softmax cross-entropy.
 
-    Each example:
-        context_ids = (token_id_{t-2}, token_id_{t-1}, token_id_t)
-        target_id   = token_id_{t+1}
+    Six parameter groups are updated per example:
+    1. W_out  (output projection)
+    2. bias
+    3. W_V    (value projection)
+    4. W_Q    (query projection)
+    5. W_K    (key projection)
+    6. embeddings + pos_embeddings
+
+    Gradient derivation (single-head attention, last position predicts):
+
+        Forward (last position i = context_size - 1):
+            e_t   = embeddings[token_id] + pos_embeddings[t]  for each t
+            Q_t   = e_t @ W_Q
+            K_t   = e_t @ W_K
+            V_t   = e_t @ W_V
+            s_j   = dot(Q_i, K_j) * scale         attention scores
+            a_j   = softmax(s)[j]                  attention weights
+            ctx   = sum_j(a_j * V_j)              context vector
+            out   = ctx @ W_out + bias
+            probs = softmax(out)
+
+        Loss gradient w.r.t. output scores:
+            d_out[j] = probs[j] - y[j]             (softmax cross-entropy shortcut)
+
+        W_out gradient:
+            d_W_out[k][j] = ctx[k] * d_out[j]
+
+        bias gradient:
+            d_bias[j] = d_out[j]
+
+        Gradient w.r.t. ctx (context vector):
+            d_ctx[k] = sum_j(W_out[k][j] * d_out[j])
+
+        Gradient w.r.t. V_j (value vectors):
+            d_V[j][k] = a_j * d_ctx[k]
+
+        Gradient w.r.t. attention weights a_j:
+            d_a[j] = dot(d_ctx, V_j)
+
+        Gradient w.r.t. attention scores s_j (through attention softmax):
+            d_s = softmax_backward(a, d_a)
+
+        Gradient w.r.t. Q_i and K_j (last query position only):
+            d_Q_i[k] = sum_j(d_s[j] * K_j[k]) * scale
+            d_K_j[k] = d_s[j] * Q_i[k] * scale
+
+        W_Q, W_K, W_V gradients (for each context position t):
+            d_W_V[m][k] += e_t[m] * d_V[t][k]
+            d_W_Q[m][k] += e_t[m] * d_Q_t[k]   (only last position i)
+            d_W_K[m][k] += e_t[m] * d_K_t[k]
+
+        Embedding gradient (for each context position t):
+            d_E[token_t][m] += sum_k(W_V[m][k] * d_V[t][k])
+                              + sum_k(W_Q[m][k] * d_Q_t[k])   (only last position)
+                              + sum_k(W_K[m][k] * d_K_t[k])
+
+        Positional embedding gradient (same as token embedding gradient):
+            d_pos[t][m] = d_E[token_t][m]
+
+    Args:
+        model:         The AttentionNextTokenModel to train.
+        pairs:         Training pairs (context_ids, next_id).
+        learning_rate: Step size for gradient updates.
+        epochs:        Number of full passes through the training data.
 
     Returns:
-        A list of per-epoch metrics dictionaries (epoch, avg_loss, accuracy).
+        List of per-epoch metric dictionaries (epoch, avg_loss, accuracy).
     """
     history: list[dict[str, float]] = []
-    vocab_size: int = model.vocab_size
+    vocab_size = model.vocab_size
+    embedding_dim = model.embedding_dim
+    head_dim = model.head_dim
+    context_size = model.context_size
+    scale = model.scale
+
+    LOG.info(
+        f"Context size: {context_size}, embedding dim: {embedding_dim}, "
+        f"head_dim: {head_dim}, vocab size: {vocab_size}, "
+        f"grad_clip={MAX_GRAD}"
+    )
 
     for epoch in range(1, epochs + 1):
         total_loss: float = 0.0
         correct: int = 0
 
         for context_ids, target_id in pairs:
-            previous2_id, previous1_id, current_id = context_ids
+            # ============================================================
+            # FORWARD PASS
+            # ============================================================
 
-            # Forward pass: probabilities for next token given (t-2, t-1, t).
-            probs: list[float] = model.forward(previous2_id, previous1_id, current_id)
+            # 1. Embedding lookup with positional encoding.
+            embs: list[list[float]] = [
+                [
+                    model.embeddings[tid][k] + model.pos_embeddings[pos][k]
+                    for k in range(embedding_dim)
+                ]
+                for pos, tid in enumerate(context_ids)
+            ]
 
-            # Loss: how surprised is the model by the correct next token?
-            loss: float = cross_entropy_loss(probs, target_id)
-            total_loss += loss
+            # 2. Q, K, V projections for all context positions.
+            Qs: list[list[float]] = [model._project(e, model.W_Q) for e in embs]
+            Ks: list[list[float]] = [model._project(e, model.W_K) for e in embs]
+            Vs: list[list[float]] = [model._project(e, model.W_V) for e in embs]
 
-            # Accuracy: did the top prediction match the target?
-            pred_id: int = argmax(probs)
-            if pred_id == target_id:
+            # 3. Attention scores and weights (using last position as query).
+            i_last = context_size - 1
+            attn_scores: list[float] = [
+                model._dot(Qs[i_last], Ks[j]) * scale for j in range(context_size)
+            ]
+            attn_weights: list[float] = softmax(attn_scores)
+
+            # 4. Context vector: weighted sum of values.
+            ctx: list[float] = [0.0] * head_dim
+            for j in range(context_size):
+                for k in range(head_dim):
+                    ctx[k] += attn_weights[j] * Vs[j][k]
+
+            # 5. Output projection -> vocab scores.
+            out_scores: list[float] = list(model.bias)
+            for k, val in enumerate(ctx):
+                for j in range(vocab_size):
+                    out_scores[j] += val * model.W_out[k][j]
+
+            # 6. Softmax -> probabilities.
+            probs: list[float] = softmax(out_scores)
+
+            # ============================================================
+            # LOSS AND ACCURACY
+            # ============================================================
+
+            total_loss += cross_entropy_loss(probs, target_id)
+            if argmax(probs) == target_id:
                 correct += 1
 
-            # Backward pass for softmax cross-entropy:
-            #   grad[j] = probs[j] - y[j]  where y is one-hot(target_id)
-            #
-            # Update the weight row for this specific (t-2, t-1, t) context.
-            row_idx: int = token_row_index_context3(context_ids, vocab_size=vocab_size)
-            row: list[float] = model.weights[row_idx]
+            # ============================================================
+            # BACKWARD PASS
+            # ============================================================
 
+            # --- Output layer ---
+
+            # d_out[j] = probs[j] - y[j]
+            d_out: list[float] = [
+                probs[j] - (1.0 if j == target_id else 0.0) for j in range(vocab_size)
+            ]
+
+            # d_W_out[k][j] = ctx[k] * d_out[j]
+            for k in range(head_dim):
+                for j in range(vocab_size):
+                    model.W_out[k][j] -= learning_rate * _clip(ctx[k] * d_out[j])
+
+            # d_bias[j] = d_out[j]
             for j in range(vocab_size):
-                y: float = 1.0 if j == target_id else 0.0
-                grad: float = probs[j] - y
-                row[j] -= learning_rate * grad
+                model.bias[j] -= learning_rate * _clip(d_out[j])
 
-        avg_loss: float = total_loss / len(pairs) if pairs else float("nan")
-        accuracy: float = correct / len(pairs) if pairs else 0.0
+            # --- Context vector gradient ---
+
+            # d_ctx[k] = sum_j(W_out[k][j] * d_out[j])
+            d_ctx: list[float] = [
+                sum(model.W_out[k][j] * d_out[j] for j in range(vocab_size))
+                for k in range(head_dim)
+            ]
+
+            # --- Value gradients ---
+
+            # d_V[j][k] = attn_weights[j] * d_ctx[k]
+            d_Vs: list[list[float]] = [
+                [attn_weights[j] * d_ctx[k] for k in range(head_dim)]
+                for j in range(context_size)
+            ]
+
+            # --- Attention weight gradients ---
+
+            # d_a[j] = dot(d_ctx, V_j)
+            d_attn_weights: list[float] = [
+                sum(d_ctx[k] * Vs[j][k] for k in range(head_dim))
+                for j in range(context_size)
+            ]
+
+            # --- Attention score gradients (through attention softmax) ---
+
+            d_attn_scores: list[float] = _softmax_backward(attn_weights, d_attn_weights)
+
+            # Scale the attention score gradients.
+            d_attn_scores = [s * scale for s in d_attn_scores]
+
+            # --- Q and K gradients (last query position only) ---
+
+            # d_Q_i[k] = sum_j(d_attn_scores[j] * K_j[k])
+            d_Q_last: list[float] = [
+                sum(d_attn_scores[j] * Ks[j][k] for j in range(context_size))
+                for k in range(head_dim)
+            ]
+
+            # d_K_j[k] = d_attn_scores[j] * Q_i[k]
+            d_Ks: list[list[float]] = [
+                [d_attn_scores[j] * Qs[i_last][k] for k in range(head_dim)]
+                for j in range(context_size)
+            ]
+
+            # --- W_Q, W_K, W_V gradients and embedding gradients ---
+
+            for t in range(context_size):
+                token_id = context_ids[t]
+                e_t = embs[t]
+
+                # W_V: d_W_V[m][k] += e_t[m] * d_V[t][k]
+                for m in range(embedding_dim):
+                    for k in range(head_dim):
+                        model.W_V[m][k] -= learning_rate * _clip(e_t[m] * d_Vs[t][k])
+
+                # W_K: d_W_K[m][k] += e_t[m] * d_K_t[k]
+                for m in range(embedding_dim):
+                    for k in range(head_dim):
+                        model.W_K[m][k] -= learning_rate * _clip(e_t[m] * d_Ks[t][k])
+
+                # W_Q: only the last position contributes to Q gradient.
+                if t == i_last:
+                    for m in range(embedding_dim):
+                        for k in range(head_dim):
+                            model.W_Q[m][k] -= learning_rate * _clip(
+                                e_t[m] * d_Q_last[k]
+                            )
+
+                # Embedding gradient: sum contributions from V, K, and Q paths.
+                d_emb: list[float] = [0.0] * embedding_dim
+
+                # From V path: d_E[m] += sum_k(W_V[m][k] * d_V[t][k])
+                for m in range(embedding_dim):
+                    d_emb[m] += sum(
+                        model.W_V[m][k] * d_Vs[t][k] for k in range(head_dim)
+                    )
+
+                # From K path: d_E[m] += sum_k(W_K[m][k] * d_K_t[k])
+                for m in range(embedding_dim):
+                    d_emb[m] += sum(
+                        model.W_K[m][k] * d_Ks[t][k] for k in range(head_dim)
+                    )
+
+                # From Q path (last position only).
+                if t == i_last:
+                    for m in range(embedding_dim):
+                        d_emb[m] += sum(
+                            model.W_Q[m][k] * d_Q_last[k] for k in range(head_dim)
+                        )
+
+                # Apply token embedding update with clipping.
+                for m in range(embedding_dim):
+                    model.embeddings[token_id][m] -= learning_rate * _clip(d_emb[m])
+
+                # Apply positional embedding update with clipping.
+                # WHY: pos_embeddings receive the same gradient as token embeddings
+                # because they are added together before Q/K/V projection.
+                for m in range(embedding_dim):
+                    model.pos_embeddings[t][m] -= learning_rate * _clip(d_emb[m])
+
+        avg_loss = total_loss / len(pairs) if pairs else float("nan")
+        accuracy = correct / len(pairs) if pairs else 0.0
 
         history.append(
-            {
-                "epoch": float(epoch),
-                "avg_loss": avg_loss,
-                "accuracy": accuracy,
-            }
+            {"epoch": float(epoch), "avg_loss": avg_loss, "accuracy": accuracy}
         )
-
         LOG.info(
             f"Epoch {epoch}/{epochs} | avg_loss={avg_loss:.6f} | accuracy={accuracy:.3f}"
         )
@@ -174,94 +391,98 @@ def train_model(
 
 
 def main() -> None:
-    """Run a simple training demo end-to-end (context-3)."""
+    """Run attention model training end-to-end."""
     from toy_gpt_train.a_tokenizer import CORPUS_DIR, SimpleTokenizer
     from toy_gpt_train.b_vocab import Vocabulary
 
-    log_header(LOG, "Training Demo: Next-Token Softmax Regression (Context-3)")
+    log_header(LOG, "Training Demo: Next-Token Prediction with Attention")
     log_path(LOG, "BASE_DIR", BASE_DIR)
     log_path(LOG, "OUTPUTS_DIR", OUTPUTS_DIR)
-    log_path(LOG, "TRAIN_LOG_PATH", TRAIN_LOG_PATH)
 
-    # Step 0: Identify the corpus file (single file rule).
     corpus_path: Path = find_single_corpus_file(CORPUS_DIR)
 
-    # Step 1: Load and tokenize the corpus.
     tokenizer: SimpleTokenizer = SimpleTokenizer(corpus_path=corpus_path)
     tokens: list[str] = tokenizer.get_tokens()
 
-    if len(tokens) < 4:
-        LOG.error(
-            "Need at least 4 tokens for context-3 training (t-2, t-1, t -> next)."
-        )
+    if len(tokens) < DEFAULT_CONTEXT_SIZE + 1:
+        LOG.error(f"Need at least {DEFAULT_CONTEXT_SIZE + 1} tokens for training.")
         return
 
-    # Step 2: Build vocabulary (maps tokens <-> integer IDs).
     vocab: Vocabulary = Vocabulary(tokens)
     vocab_size: int = vocab.vocab_size()
 
-    # Step 3: Convert token strings to integer IDs for training.
     token_ids: list[int] = []
     for tok in tokens:
-        tok_id: int | None = vocab.get_token_id(tok)
+        tok_id = vocab.get_token_id(tok)
         if tok_id is None:
             LOG.error("Token not found in vocabulary: %r", tok)
             return
         token_ids.append(tok_id)
 
-    # Step 4: Create training pairs (context-3 -> next).
-    pairs: list[Context3Pair] = make_training_pairs(token_ids)
-    LOG.info(f"Created {len(pairs)} training pairs.")
-
-    # Step 5: Initialize model with zero weights (context-3 table lives in c_model.py).
-    model: SimpleNextTokenModel = SimpleNextTokenModel(vocab_size=vocab_size)
-
-    # Step 6: Train the model.
-    learning_rate: float = 0.1
-    epochs: int = 50
-
-    history: list[dict[str, float]] = train_model(
-        model=model,
-        pairs=pairs,
-        learning_rate=learning_rate,
-        epochs=epochs,
+    pairs: list[ContextPair] = make_training_pairs(
+        token_ids, context_size=DEFAULT_CONTEXT_SIZE
+    )
+    LOG.info(
+        f"Created {len(pairs)} training pairs (context_size={DEFAULT_CONTEXT_SIZE})."
     )
 
-    # Step 7: Save training metrics for analysis.
+    model: AttentionNextTokenModel = AttentionNextTokenModel(
+        vocab_size=vocab_size,
+        embedding_dim=DEFAULT_EMBEDDING_DIM,
+        head_dim=DEFAULT_HEAD_DIM,
+        context_size=DEFAULT_CONTEXT_SIZE,
+    )
+
+    # OBS: lr=0.01 caused no symmetry breaking without positional embeddings.
+    # OBS: positional embeddings added to c_model.py to break position symmetry.
+    # OBS: gradient clipping (MAX_GRAD=1.0) added to prevent weight explosion.
+    learning_rate: float = 0.01
+    epochs: int = 100
+
+    history = train_model(
+        model=model, pairs=pairs, learning_rate=learning_rate, epochs=epochs
+    )
+
     write_training_log(TRAIN_LOG_PATH, history)
 
-    # Step 7b: Write inspectable artifacts for downstream use.
     write_artifacts(
         base_dir=BASE_DIR,
         corpus_path=corpus_path,
         vocab=vocab,
         model=model,
-        model_kind="context3",
+        model_kind="attention",
         learning_rate=learning_rate,
         epochs=epochs,
-        row_labeler=row_labeler_context3(vocab, vocab_size),
+        row_labeler=row_labeler_attention(vocab, DEFAULT_CONTEXT_SIZE),
     )
 
-    # Step 8: Qualitative check - what does the model predict after the first 3 tokens?
-    previous2_token: str = tokens[0]
-    previous1_token: str = tokens[1]
-    current_token: str = tokens[2]
+    # Qualitative check.
+    context_tokens = tokens[:DEFAULT_CONTEXT_SIZE]
+    context_ids: list[int] = []
+    for tok in context_tokens:
+        tid = vocab.get_token_id(tok)
+        if tid is None:
+            LOG.error("Token not found: %r", tok)
+            return
+        context_ids.append(tid)
 
-    previous2_id: int | None = vocab.get_token_id(previous2_token)
-    previous1_id: int | None = vocab.get_token_id(previous1_token)
-    current_id: int | None = vocab.get_token_id(current_token)
-
-    if previous2_id is None or previous1_id is None or current_id is None:
-        LOG.error("One of the sample tokens was not found in vocabulary.")
-        return
-
-    probs: list[float] = model.forward(previous2_id, previous1_id, current_id)
-    best_next_id: int = argmax(probs)
-    best_next_tok: str | None = vocab.get_id_token(best_next_id)
+    probs = model.forward(context_ids)
+    best_id = argmax(probs)
+    best_tok = vocab.get_id_token(best_id)
 
     LOG.info(
-        f"After training, most likely next token after {previous2_token!r}|{previous1_token!r}|{current_token!r} is {best_next_tok!r} (ID: {best_next_id})."
+        f"After training, most likely next token after "
+        f"{context_tokens} is {best_tok!r} (ID {best_id})."
     )
+
+    # Show attention weights after training — the inspectable artifact
+    # unique to this model.
+    attn = model.get_attention_weights(context_ids)
+    LOG.info(f"Attention weights after training (context: {context_tokens}):")
+    for i, row in enumerate(attn):
+        tok = context_tokens[i]
+        formatted = "  ".join(f"{w:.3f}" for w in row)
+        LOG.info(f"  {tok!r}: [{formatted}]")
 
 
 if __name__ == "__main__":

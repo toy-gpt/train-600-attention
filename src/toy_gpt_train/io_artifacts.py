@@ -1,4 +1,5 @@
-"""io_artifacts.py - Input/output and training-artifact utilities used by the models.
+"""io_artifacts.py - Input/output and training-artifact utilities
+used by the embeddings-based models.
 
 This module is responsible for persisting and describing the results of
 model training in a consistent, inspectable format.
@@ -96,7 +97,23 @@ from typing import Final, Protocol
 
 from datafun_toolkit.logger import get_logger
 
-from toy_gpt_train.c_model import SimpleNextTokenModel
+
+class ModelLike(Protocol):
+    """Protocol for model-like objects used in training and artifacts.
+    All are read-only properties to ensure artifacts capture the state of the model
+    at the end of training, not during training."""
+
+    @property
+    def vocab_size(self) -> int: ...
+    @property
+    def weights(self) -> list[list[float]]: ...
+    @property
+    def embeddings(self) -> list[list[float]] | None: ...
+    @property
+    def pos_embeddings(self) -> list[list[float]] | None: ...
+    @property
+    def bias(self) -> list[float] | None: ...
+
 
 __all__ = [
     "JsonObject",
@@ -213,12 +230,29 @@ def sha256_of_file(path: Path) -> str:
     return sha256_of_bytes(data)
 
 
+def write_positional_embeddings_csv(
+    path: Path,
+    model: ModelLike,
+) -> None:
+    """Write 04_positional_embeddings.csv — one row per context position."""
+    if model.pos_embeddings is None:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    dim = len(model.pos_embeddings[0])
+    with path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["position"] + [f"dim_{k}" for k in range(dim)])
+        for pos, vec in enumerate(model.pos_embeddings):
+            writer.writerow([pos] + [_fmt_float(v, decimals=6) for v in vec])
+    LOG.info(f"Wrote positional embeddings to {path}")
+
+
 def write_artifacts(
     *,
     base_dir: Path,
     corpus_path: Path,
     vocab: VocabularyLike,
-    model: SimpleNextTokenModel,
+    model: ModelLike,
     model_kind: str,
     learning_rate: float,
     epochs: int,
@@ -242,12 +276,14 @@ def write_artifacts(
     vocab_path: Final[Path] = artifacts_dir / "01_vocabulary.csv"
     weights_path: Final[Path] = artifacts_dir / "02_model_weights.csv"
     embeddings_path: Final[Path] = artifacts_dir / "03_token_embeddings.csv"
+    pos_embeddings_path: Final[Path] = artifacts_dir / "04_positional_embeddings.csv"
 
     artifacts_dir.mkdir(parents=True, exist_ok=True)
 
     write_vocabulary_csv(vocab_path, vocab)
     write_model_weights_csv(weights_path, vocab, model, row_labeler=row_labeler)
-    write_token_embeddings_csv(embeddings_path, model, row_labeler=row_labeler)
+    write_token_embeddings_csv(embeddings_path, vocab, model)
+    write_positional_embeddings_csv(pos_embeddings_path, model)
     write_meta_json(
         meta_path,
         base_dir=base_dir,
@@ -358,6 +394,11 @@ def write_meta_json(
                 "An optimization process that incrementally adjusts weights "
                 "to reduce prediction error."
             ),
+            "positional_encoding": (
+                "A learned vector added to each token embedding before Q/K/V projection. "
+                "Gives the model information about token position in the context window. "
+                "Without it, attention is position-invariant and symmetry never breaks."
+            ),
         },
         "notes": [
             "This is an intentionally inspectable training pipeline.",
@@ -380,7 +421,7 @@ def write_meta_json(
 def write_model_weights_csv(
     path: Path,
     vocab: VocabularyLike,
-    model: SimpleNextTokenModel,
+    model: ModelLike,
     *,
     row_labeler: RowLabeler,
 ) -> None:
@@ -417,44 +458,41 @@ def write_model_weights_csv(
 
 def write_token_embeddings_csv(
     path: Path,
-    model: SimpleNextTokenModel,
-    *,
-    row_labeler: RowLabeler,
+    vocab: VocabularyLike,  # ← add vocab parameter
+    model: ModelLike,  # ← was EmbeddingNextTokenModel
 ) -> None:
-    """Write 03_token_embeddings.csv as a simple 2D projection.
+    """Write 03_token_embeddings.csv.
 
-    This file is a derived visualization artifact, not a learned embedding table.
+    For models with learned embeddings (500+): writes the full embedding
+    vector for each vocabulary token — one row per token.
 
-    For each model weight row:
-        - x coordinate = first weight (if present)
-        - y coordinate = second weight (if present)
-
-    If a row has fewer than two weights, missing values default to 0.0.
-
-    Args:
-        path: Output CSV path.
-        model: Trained model providing a weight matrix.
-        row_labeler: Function mapping row index to a human-readable label.
+    For earlier models (100-400): writes a 2D projection from model weights
+    as a visualization artifact only.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
 
     with path.open("w", encoding="utf-8", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(["row", "label", "x", "y"])
 
-        for row_idx, row in enumerate(model.weights):
-            # Defensive defaults
-            x: float = row[0] if len(row) >= 1 else 0.0
-            y: float = row[1] if len(row) >= 2 else 0.0
+        if model.embeddings is not None:
+            # Learned embeddings: one row per vocab token, full vector.
+            dim = len(model.embeddings[0]) if model.embeddings else 0
+            writer.writerow(["token_id", "token"] + [f"dim_{k}" for k in range(dim)])
 
-            writer.writerow(
-                [
-                    row_idx,
-                    row_labeler(row_idx),
-                    _fmt_float(x, decimals=4),
-                    _fmt_float(y, decimals=4),
-                ]
-            )
+            for token_id, vec in enumerate(model.embeddings):
+                token = vocab.get_id_token(token_id) or f"id_{token_id}"
+                writer.writerow(
+                    [token_id, token] + [_fmt_float(v, decimals=6) for v in vec]
+                )
+        else:
+            # Derived 2D projection from weights (levels 100-400).
+            writer.writerow(["row", "label", "x", "y"])
+            for row_idx, row in enumerate(model.weights):
+                x = row[0] if len(row) >= 1 else 0.0
+                y = row[1] if len(row) >= 2 else 0.0
+                writer.writerow(
+                    [row_idx, f"row_{row_idx}", _fmt_float(x), _fmt_float(y)]
+                )
 
     LOG.info(f"Wrote token embeddings to {path}")
 
