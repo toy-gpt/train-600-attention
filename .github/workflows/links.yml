@@ -1,0 +1,19 @@
+# ============================================================
+# .github/workflows/links.yml (Lychee Link Checker)
+# ============================================================
+# WHY: Calls org-level link checker; maintained centrally in toy-gpt/.github.
+
+name: Check Links
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 6 2 * *"
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  links:
+    uses: toy-gpt/.github/.github/workflows/links.yml@main

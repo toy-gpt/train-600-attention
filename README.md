@@ -1,0 +1,143 @@
+# train-600-attention
+
+[![Docs](https://img.shields.io/badge/docs-live-blue)](https://toy-gpt.github.io/train-600-attention/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/license/MIT)
+[![CI](https://github.com/toy-gpt/train-600-attention/actions/workflows/ci-shared.yml/badge.svg?branch=main)](https://github.com/toy-gpt/train-600-attention/actions/workflows/ci-shared.yml)
+[![Deploy-Docs](https://github.com/toy-gpt/train-600-attention/actions/workflows/deploy-docs-shared.yml/badge.svg?branch=main)](https://github.com/toy-gpt/train-600-attention/actions/workflows/deploy-docs-shared.yml)
+[![Check Links](https://github.com/toy-gpt/train-600-attention/actions/workflows/links.yml/badge.svg)](https://github.com/toy-gpt/train-600-attention/actions/workflows/links.yml)
+[![Dependabot](https://img.shields.io/badge/Dependabot-enabled-brightgreen.svg)](https://github.com/toy-gpt/train-600-attention/security)
+
+
+> Demonstrates, at very small scale, how a language model is trained.
+
+This repository is part of a series of toy training repositories plus a companion client repository:
+
+- [**Training repositories**](https://github.com/toy-gpt) produce pretrained artifacts (vocabulary, weights, metadata).
+- A [**web app**](https://toy-gpt.github.io/toy-gpt-chat/) loads the artifacts and provides an interactive prompt.
+
+## Contents
+
+- a small, declared text corpus
+- a tokenizer and vocabulary builder
+- a simple next-token prediction model
+- a repeatable training loop
+- committed, inspectable artifacts for downstream use
+
+## Scope
+
+This is:
+
+- an educational, inspectable training pipeline
+- a next-token predictor trained on an explicit corpus
+
+This is not:
+
+- a production system
+- a full Transformer implementation
+- a chat interface
+- a claim of semantic understanding
+
+## Outputs
+
+This repository produces and commits pretrained artifacts under `artifacts/`.
+
+These artifacts are intended to be loaded by the companion client repository.
+
+Typical artifacts include:
+
+- `artifacts/vocab.json`
+- `artifacts/weights.csv` (or similar)
+- `artifacts/model_meta.json`
+
+Training logs and evidence are written under `outputs/`
+(for example, `outputs/train_log.csv`).
+
+## Quick start
+
+See `SETUP.md` for full setup and workflow instructions.
+
+Run the full training script:
+
+```shell
+uv run python src/toy_gpt_train/d_train.py
+```
+
+Run individual pipeline steps:
+
+```shell
+uv run python src/toy_gpt_train/a_tokenizer.py
+uv run python src/toy_gpt_train/b_vocab.py
+uv run python src/toy_gpt_train/c_model.py
+uv run python src/toy_gpt_train/d_train.py
+uv run python src/toy_gpt_train/e_infer.py
+```
+
+## Command Reference
+
+The commands below are used in the workflow guide above.
+They are provided here for convenience.
+
+Follow the guide for the **full instructions**.
+
+<details>
+<summary>Show command reference</summary>
+
+### In a machine terminal (open in your `Repos` folder)
+
+After you get a copy of this repo in your own GitHub account,
+open a machine terminal in your `Repos` folder:
+
+```shell
+# Replace username with YOUR GitHub username.
+git clone https://github.com/username/train-600-attention
+
+cd train-600-attention
+code .
+```
+
+### In a VS Code terminal
+
+```shell
+uv self update
+uv python pin 3.14
+uv sync --extra dev --extra docs --upgrade
+
+uvx pre-commit install
+git add -A
+uvx pre-commit run --all-files
+
+# run Python
+
+uv run ruff format .
+uv run ruff check . --fix
+uv run zensical build
+
+git add -A
+git commit -m "update"
+git push -u origin main
+```
+
+</details>
+
+## Provenance and Purpose
+
+The primary corpus used for training is declared in `SE_MANIFEST.toml`.
+
+This repository commits pretrained artifacts so the client can run
+without retraining.
+
+## Annotations
+
+[ANNOTATIONS.md](./ANNOTATIONS.md) - REQ/WHY/OBS annotations used
+
+## Citation
+
+[CITATION.cff](./CITATION.cff)
+
+## License
+
+[MIT](./LICENSE)
+
+## SE Manifest
+
+[SE_MANIFEST.toml](./SE_MANIFEST.toml) - project intent, scope, and role

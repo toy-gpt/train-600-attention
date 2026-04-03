@@ -1,0 +1,22 @@
+# config.toml
+# Inference configuration for e_infer.py.
+# These values control how the inference demo runs.
+# Override any value by passing a command-line argument to e_infer.py.
+
+[infer]
+
+# The 3-token seed used to start text generation.
+# Must be tokens that appear together in the training corpus.
+# The model uses (seed_0, seed_1, seed_2) as the initial context
+# so predictions are drawn from learned weights, not uniform defaults.
+seed_0 = "the"
+seed_1 = "tabby"
+seed_2 = "cat"
+
+# Number of new tokens to generate after the start token.
+num_tokens = 10
+
+# Number of top predictions to display for the bootstrap context.
+# "top-k" means the k tokens with the highest predicted probability.
+# Higher values show more of the probability distribution.
+topk = 5

@@ -1,0 +1,63 @@
+data analytics is the practice of using data
+data analytics turns data into insight
+data analytics supports decision making
+
+data is a collection of values
+data can be structured or unstructured
+data must be collected carefully
+
+an analysis is a systematic examination
+an analysis answers a question
+an analysis depends on assumptions
+
+a dataset is a collection of records
+a dataset has rows and columns
+a dataset requires documentation
+
+a variable represents a value
+a variable has a name
+a variable has a type
+
+a numeric variable stores numbers
+a numeric variable supports calculation
+a numeric variable enables measurement
+
+a categorical variable stores labels
+a categorical variable groups observations
+a categorical variable is not ordered
+
+a model is a simplified representation
+a model approximates reality
+a model has limitations
+
+a prediction estimates an outcome
+a prediction is probabilistic
+a prediction is not a guarantee
+
+a metric measures performance
+a metric summarizes behavior
+a metric guides evaluation
+
+accuracy measures correctness
+accuracy depends on context
+accuracy can be misleading
+
+a pipeline is a sequence of steps
+a pipeline transforms data
+a pipeline improves repeatability
+
+reproducibility means results can be repeated
+reproducibility depends on code and data
+reproducibility builds trust
+
+documentation explains decisions
+documentation supports reuse
+documentation reduces confusion
+
+ethics guide responsible analysis
+ethics require transparency
+ethics apply to data work
+
+automation increases efficiency
+automation reduces manual error
+automation requires oversight
