@@ -70,7 +70,6 @@ artifacts = [
   "LICENSE",
   "README.md",
   "SE_MANIFEST.toml",
-  "SETUP.md",
 ]
 
 [scope]
