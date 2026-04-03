@@ -19,12 +19,12 @@ org = "toy-gpt"
 kind = "software"
 status = "academic"
 since = "2026"
-summary = "Toy language model training: context-3 next-token predictor (uses the previous 3 tokens)."
+summary = "Toy language model training: context-2 next-token predictor (uses the previous 2 tokens)."
 
 [training]
-capability = "context-3"
-context_window = 3
-architecture = "toy next-token model with fixed context window (3 tokens)"
+capability = "context-2"
+context_window = 2
+architecture = "toy next-token model with fixed context window (2 tokens)"
 task = "next-token prediction"
 
 [observation]
